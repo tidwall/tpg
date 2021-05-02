@@ -3,15 +3,18 @@ package tpg
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 
 	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 // ErrAlreadyConnected is returned when there already a connection to the
 // database.
 var ErrAlreadyConnected = errors.New("already connected")
+
+// ErrNotConnected is returned when there is no connection
+var ErrNotConnected = errors.New("not connected")
 
 // ErrNotFound is returned when QueryOne or ExecReturnID do not return a row.
 var ErrNotFound = errors.New("not found")
@@ -21,7 +24,45 @@ var ErrNotFound = errors.New("not found")
 var ErrRowBreak = errors.New("row break")
 
 var connMu sync.Mutex
-var pool *pgxpool.Pool
+var pool []*pgx.Conn
+var poolURL string
+
+var maxConns = runtime.NumCPU()
+
+func poolRelease(conn *pgx.Conn) {
+	connMu.Lock()
+	defer connMu.Unlock()
+	if len(pool) == maxConns {
+		go func() { conn.Close(context.Background()) }()
+	} else {
+		pool = append(pool, conn)
+	}
+}
+func poolAcquire(ctx context.Context) (*pgx.Conn, error) {
+	connMu.Lock()
+	if pool == nil {
+		connMu.Unlock()
+		return nil, ErrNotConnected
+	}
+	for len(pool) > 0 {
+		conn := pool[len(pool)-1]
+		pool[len(pool)-1] = nil
+		pool = pool[:len(pool)-1]
+		connMu.Unlock()
+		if err := conn.Ping(ctx); err != nil {
+			go func() { conn.Close(context.Background()) }()
+			connMu.Lock()
+			continue
+		}
+		return conn, nil
+	}
+	connMu.Unlock()
+	conn, err := pgx.Connect(ctx, poolURL)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
 
 // Connect to the database. This should be called once, and probably at
 // application start up.
@@ -32,11 +73,12 @@ func Connect(url string) error {
 	if pool != nil {
 		return ErrAlreadyConnected
 	}
-	var err error
-	pool, err = pgxpool.Connect(context.Background(), url)
+	conn, err := pgx.Connect(context.Background(), url)
 	if err != nil {
 		return err
 	}
+	poolURL = url
+	pool = []*pgx.Conn{conn}
 	return nil
 }
 
@@ -153,18 +195,33 @@ func (tx *dbTx) ExecReturnID(sql string, args ...interface{}) (int64, error) {
 // Return an error to rollback the transaction.
 func Begin(fn func(tx Tx) error) error {
 	ctx := context.Background()
-	conn, err := pool.Acquire(ctx)
+	conn, err := poolAcquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	var ok bool
+	defer func() {
+		if ok {
+			poolRelease(conn)
+		} else {
+			go func() { conn.Close(context.Background()) }()
+		}
+	}()
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		if !ok {
+			tx.Rollback(ctx)
+		}
+	}()
 	if err := fn(&dbTx{ctx: ctx, tx: tx}); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
